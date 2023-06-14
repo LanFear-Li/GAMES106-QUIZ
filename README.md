@@ -1,2 +1,1 @@
-# GAMES106-QUIZ
-PAs for GAMES106
+# GAMES106 Programming Assignment
