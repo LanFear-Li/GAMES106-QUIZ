@@ -146,6 +146,13 @@ public:
         uint32_t    samplerIndex;
     };
 
+    struct Skeleton
+    {
+        std::vector<glm::mat4> nodeTransform;
+        vks::Buffer ssbo;
+        VkDescriptorSet descriptorSet{};
+    } skeleton;
+
     struct Animation
     {
         std::string                   name;
@@ -181,9 +188,7 @@ public:
 			vkFreeMemory(vulkanDevice->logicalDevice, image.texture.deviceMemory, nullptr);
 		}
 
-        for (Skin skin : skins) {
-            skin.ssbo.destroy();
-        }
+        skeleton.ssbo.destroy();
 	}
 
 	/*
@@ -333,8 +338,7 @@ public:
     void loadAnimations(tinygltf::Model &input) {
         animations.resize(input.animations.size());
 
-        for (size_t i = 0; i < input.animations.size(); i++)
-        {
+        for (size_t i = 0; i < input.animations.size(); i++) {
             tinygltf::Animation glTFAnimation = input.animations[i];
             animations[i].name                = glTFAnimation.name;
 
@@ -405,8 +409,7 @@ public:
 
             // Channels
             animations[i].channels.resize(glTFAnimation.channels.size());
-            for (size_t j = 0; j < glTFAnimation.channels.size(); j++)
-            {
+            for (size_t j = 0; j < glTFAnimation.channels.size(); j++) {
                 tinygltf::AnimationChannel glTFChannel = glTFAnimation.channels[j];
                 AnimationChannel &         dstChannel  = animations[i].channels[j];
                 dstChannel.path                        = glTFChannel.target_path;
@@ -414,6 +417,24 @@ public:
                 dstChannel.node                        = nodeFromIndex(glTFChannel.target_node);
             }
         }
+    }
+
+    void prepareAnimations(tinygltf::Model &input) {
+        skeleton.nodeTransform.resize(input.nodes.size(), glm::mat4(1.f));
+
+        VK_CHECK_RESULT(vulkanDevice->createBuffer(
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                &skeleton.ssbo,
+                sizeof(glm::mat4) * skeleton.nodeTransform.size(),skeleton.nodeTransform.data()));
+        VK_CHECK_RESULT(skeleton.ssbo.map());
+
+
+        for (auto& node : nodes)
+        {
+            updateNodeTransform(node);
+        }
+        skeleton.ssbo.copyTo(skeleton.nodeTransform.data(), sizeof(glm::mat4) * skeleton.nodeTransform.size());
     }
 
     void loadNode(const tinygltf::Node &inputNode, const tinygltf::Model &input, VulkanglTFModel::Node *parent, uint32_t nodeIndex, std::vector<uint32_t> &indexBuffer, std::vector<VulkanglTFModel::Vertex> &vertexBuffer) {
@@ -629,6 +650,26 @@ public:
         }
     }
 
+    // update node transformations
+    void updateNodeTransform(Node* node) {
+        if (node != VK_NULL_HANDLE) {
+            return;
+        }
+
+        glm::mat4 nodeMatrix = node->getLocalMatrix();
+        VulkanglTFModel::Node* currentParent = node->parent;
+        while (currentParent) {
+            nodeMatrix = currentParent->getLocalMatrix() * nodeMatrix;
+            currentParent = currentParent->parent;
+        }
+
+        skeleton.nodeTransform[node->index] = nodeMatrix;
+
+        for (auto&& child : node->children) {
+            updateNodeTransform(child);
+        }
+    }
+
     // POI: Update the current animation
     void updateAnimation(float deltaTime)
     {
@@ -686,10 +727,11 @@ public:
                 }
             }
         }
-        for (auto &node : nodes)
-        {
-            updateJoints(node);
+
+        for (auto& node: nodes) {
+            updateNodeTransform(node);
         }
+        skeleton.ssbo.copyTo(skeleton.nodeTransform.data(), skeleton.nodeTransform.size() * sizeof(glm::mat4));
     }
 
 	/*
@@ -697,22 +739,20 @@ public:
 	*/
 
     // Draw a single node including child nodes (if present)
-    void drawNode(VkCommandBuffer commandBuffer, VkPipelineLayout pipelineLayout, VulkanglTFModel::Node node) {
-        if (node.mesh.primitives.size() > 0) {
+    void drawNode(VkCommandBuffer commandBuffer, VkPipelineLayout pipelineLayout, VulkanglTFModel::Node *node) {
+        if (!node->mesh.primitives.empty()) {
             // Pass the node's matrix via push constants
             // Traverse the node hierarchy to the top-most parent to get the final matrix of the current node
-            glm::mat4              nodeMatrix    = node.matrix;
-            VulkanglTFModel::Node *currentParent = node.parent;
-            while (currentParent) {
-                nodeMatrix    = currentParent->matrix * nodeMatrix;
-                currentParent = currentParent->parent;
-            }
+            glm::mat4 nodeMatrix = getNodeMatrix(node);
+
+
             // Pass the final matrix to the vertex shader using push constants
             vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &nodeMatrix);
 
             // Bind SSBO with skin data for this node to set 1
             // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &skins[node.skin].descriptorSet, 0, nullptr);
-            for (VulkanglTFModel::Primitive &primitive : node.mesh.primitives) {
+
+            for (VulkanglTFModel::Primitive &primitive : node->mesh.primitives) {
                 if (primitive.indexCount > 0) {
                     // Get the texture index for this primitive
                     VulkanglTFModel::Texture texture = textures[materials[primitive.materialIndex].baseColorTextureIndex];
@@ -722,8 +762,8 @@ public:
                 }
             }
         }
-        for (auto &child : node.children) {
-            drawNode(commandBuffer, pipelineLayout, *child);
+        for (auto &child : node->children) {
+            drawNode(commandBuffer, pipelineLayout, child);
         }
     }
 
@@ -733,9 +773,11 @@ public:
         VkDeviceSize offsets[1] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
         vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 2, 1, &skeleton.descriptorSet, 0, nullptr);
+
         // Render all nodes at top-level
         for (auto &node : nodes) {
-            drawNode(commandBuffer, pipelineLayout, *node);
+            drawNode(commandBuffer, pipelineLayout, node);
         }
     }
 
@@ -768,7 +810,7 @@ public:
 	struct DescriptorSetLayouts {
 		VkDescriptorSetLayout matrices;
 		VkDescriptorSetLayout textures;
-        VkDescriptorSetLayout jointMatrices;
+        VkDescriptorSetLayout transform;
 	} descriptorSetLayouts;
 
 	VulkanExample() : VulkanExampleBase(ENABLE_VALIDATION)
@@ -793,7 +835,7 @@ public:
 		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.matrices, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
-        // vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.jointMatrices, nullptr);
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.transform, nullptr);
 
 		shaderData.buffer.destroy();
 	}
@@ -876,12 +918,8 @@ public:
 				glTFModel.loadNode(node, glTFInput, nullptr, scene.nodes[i], indexBuffer, vertexBuffer);
 			}
 
-            glTFModel.loadSkins(glTFInput);
             glTFModel.loadAnimations(glTFInput);
-            // Calculate initial pose
-            for (auto node : glTFModel.nodes) {
-                glTFModel.updateJoints(node);
-            }
+            glTFModel.prepareAnimations(glTFInput);
 		}
 		else {
 			vks::tools::exitFatal("Could not open the glTF file.\n\nThe file is part of the additional asset pack.\n\nRun \"download_assets.py\" in the repository root to download the latest version.", -1);
@@ -980,7 +1018,7 @@ public:
             vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<uint32_t>(glTFModel.skins.size())),
 		};
 		// One set for matrices and one per model image/texture
-		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + static_cast<uint32_t>(glTFModel.skins.size()) + 1;
+		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + 2;
 		VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, maxSetCount);
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
@@ -996,15 +1034,16 @@ public:
 		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures))
 
-        // Descriptor set layout for passing skin joint matrices
-        // setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
-        // VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.jointMatrices));
+        // Descriptor set layout for passing node transformations
+        setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
+        VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.transform));
 
         // Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material, set 2 = joint)
-		std::array<VkDescriptorSetLayout, 2> setLayouts = {
+		std::array<VkDescriptorSetLayout, 3> setLayouts = {
                 descriptorSetLayouts.matrices,
-                // descriptorSetLayouts.jointMatrices,
                 descriptorSetLayouts.textures,
+                descriptorSetLayouts.transform,
+
         };
 		VkPipelineLayoutCreateInfo pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 
@@ -1021,14 +1060,6 @@ public:
 		VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &shaderData.buffer.descriptor);
 		vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 
-        // Descriptor set for glTF model skin joint matrices
-        /*for (auto &skin : glTFModel.skins) {
-            const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.jointMatrices, 1);
-            VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &skin.descriptorSet));
-            VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(skin.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &skin.ssbo.descriptor);
-            vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
-        }*/
-
         // Descriptor sets for glTF model materials
         for (auto& image : glTFModel.images) {
             const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
@@ -1036,6 +1067,12 @@ public:
             VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
             vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
         }
+
+        // Descriptor set for node matrix
+        allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.transform, 1);
+        VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &glTFModel.skeleton.descriptorSet));
+        writeDescriptorSet = vks::initializers::writeDescriptorSet(glTFModel.skeleton.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &glTFModel.skeleton.ssbo.descriptor);
+        vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 	}
 
 	void preparePipelines()
@@ -1141,6 +1178,7 @@ public:
         // POI: Advance animation
         if (!paused) {
             glTFModel.updateAnimation(frameTimer);
+            buildCommandBuffers();
         }
 	}
 
