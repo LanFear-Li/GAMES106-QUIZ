@@ -78,7 +78,8 @@ function(buildHomeworks)
 endfunction(buildHomeworks)
 
 set(HOMEWORKS
-	homework0
+	# renderer
+	# homework0
 	homework1
 	homework2
 )
