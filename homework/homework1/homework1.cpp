@@ -53,12 +53,29 @@ public:
 
 	// The following structures roughly represent the glTF scene structure
 	// To keep things simple, they only contain those properties that are required for this sample
-	struct Node;
+
+    struct Node;
 
     // A glTF material stores information in e.g. the texture that is attached to it and colors
+    struct MaterialFactor {
+        vks::Buffer buffer;
+        struct Values {
+            glm::vec4 baseColorFactor = glm::vec4(1.0f);
+            glm::vec3 emissiveFactor = glm::vec3(1.0f);
+
+            // R for metallic, G for roughness
+            glm::vec3 metallicRoughness = glm::vec3(1.0f);
+        };
+    };
+
     struct Material {
-        glm::vec4 baseColorFactor = glm::vec4(1.0f);
+        MaterialFactor factors;
+
         uint32_t baseColorTextureIndex{};
+        uint32_t metallicRoughnessTextureIndex{};
+        uint32_t normalTextureIndex{};
+
+        VkDescriptorSet descriptorSet{};
     };
 
     // Contains the texture for a single glTF image
@@ -181,6 +198,7 @@ public:
 		vkFreeMemory(vulkanDevice->logicalDevice, vertices.memory, nullptr);
 		vkDestroyBuffer(vulkanDevice->logicalDevice, indices.buffer, nullptr);
 		vkFreeMemory(vulkanDevice->logicalDevice, indices.memory, nullptr);
+
 		for (Image image : images) {
 			vkDestroyImageView(vulkanDevice->logicalDevice, image.texture.view, nullptr);
 			vkDestroyImage(vulkanDevice->logicalDevice, image.texture.image, nullptr);
@@ -188,7 +206,13 @@ public:
 			vkFreeMemory(vulkanDevice->logicalDevice, image.texture.deviceMemory, nullptr);
 		}
 
+        // Release all Vulkan resources allocated for the animation
         skeleton.ssbo.destroy();
+
+        // Release all Vulkan resources allocated for materials
+        for (auto& material : materials) {
+            material.factors.buffer.destroy();
+        }
 	}
 
 	/*
@@ -247,14 +271,30 @@ public:
 		for (size_t i = 0; i < input.materials.size(); i++) {
 			// We only read the most basic properties required for our sample
 			tinygltf::Material glTFMaterial = input.materials[i];
+
+            /*if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end()) {
+                materials[i].baseColorTexture = getTexture(input.textures[glTFMaterial.values["baseColorTexture"].TextureIndex()].source);
+            }*/
+
+            // Get base color texture index
+            if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end()) {
+                materials[i].baseColorTextureIndex = glTFMaterial.values["baseColorTexture"].TextureIndex();
+            }
+
 			// Get the base color factor
 			if (glTFMaterial.values.find("baseColorFactor") != glTFMaterial.values.end()) {
 				materials[i].baseColorFactor = glm::make_vec4(glTFMaterial.values["baseColorFactor"].ColorFactor().data());
 			}
-			// Get base color texture index
-			if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end()) {
-				materials[i].baseColorTextureIndex = glTFMaterial.values["baseColorTexture"].TextureIndex();
-			}
+
+            // Get the roughness factor
+            if (glTFMaterial.values.find("roughnessFactor") != glTFMaterial.values.end()) {
+                materials[i].roughnessFactor = static_cast<float>(glTFMaterial.values["roughnessFactor"].Factor());
+            }
+
+            // Get the metallic factor
+            if (glTFMaterial.values.find("metallicFactor") != glTFMaterial.values.end()) {
+                materials[i].metallicFactor = static_cast<float>(glTFMaterial.values["metallicFactor"].Factor());
+            }
 		}
 	}
 
@@ -652,7 +692,7 @@ public:
 
     // update node transformations
     void updateNodeTransform(Node* node) {
-        if (node != VK_NULL_HANDLE) {
+        if (node == VK_NULL_HANDLE) {
             return;
         }
 
@@ -744,7 +784,6 @@ public:
             // Pass the node's matrix via push constants
             // Traverse the node hierarchy to the top-most parent to get the final matrix of the current node
             glm::mat4 nodeMatrix = getNodeMatrix(node);
-
 
             // Pass the final matrix to the vertex shader using push constants
             vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &nodeMatrix);
@@ -1011,11 +1050,12 @@ public:
 		*/
 
 		std::vector<VkDescriptorPoolSize> poolSizes = {
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
+            // One uniform buffer block for each model's texture
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<uint32_t>(2 + glTFModel.materials.size())),
 			// One combined image sampler per model image/texture
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size())),
-            // One ssbo per skin
-            vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<uint32_t>(glTFModel.skins.size())),
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(3 * glTFModel.materials.size() + 1)),
+            // ssbo for animation data
+            vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
 		};
 		// One set for matrices and one per model image/texture
 		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + 2;
@@ -1038,12 +1078,11 @@ public:
         setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
         VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.transform));
 
-        // Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material, set 2 = joint)
+        // Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = textures, set 2 = model transform)
 		std::array<VkDescriptorSetLayout, 3> setLayouts = {
                 descriptorSetLayouts.matrices,
                 descriptorSetLayouts.textures,
                 descriptorSetLayouts.transform,
-
         };
 		VkPipelineLayoutCreateInfo pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 
