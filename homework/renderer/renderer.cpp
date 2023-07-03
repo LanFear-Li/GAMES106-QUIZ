@@ -20,8 +20,6 @@ VulkanglTFModel::~VulkanglTFModel()
         vkDestroySampler(vulkanDevice->logicalDevice, image.texture.sampler, nullptr);
         vkFreeMemory(vulkanDevice->logicalDevice, image.texture.deviceMemory, nullptr);
     }
-
-    skeleton.ssbo.destroy();
 }
 
 /*
@@ -86,17 +84,12 @@ void VulkanglTFModel::loadMaterials(tinygltf::Model &input)
     {
         // We only read the most basic properties required for our sample
         tinygltf::Material glTFMaterial = input.materials[i];
-        // Get the base color factor
-        if (glTFMaterial.values.find("baseColorFactor") != glTFMaterial.values.end())
-        {
-            materials[i].baseColorFactor = glm::make_vec4(
-                    glTFMaterial.values["baseColorFactor"].ColorFactor().data());
-        }
-        // Get base color texture index
-        if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end())
-        {
-            materials[i].baseColorTextureIndex = glTFMaterial.values["baseColorTexture"].TextureIndex();
-        }
+
+        materials[i].baseColorTextureIndex = glTFMaterial.pbrMetallicRoughness.baseColorTexture.index;
+        materials[i].metallicRoughnessTextureIndex = glTFMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index;
+        materials[i].normalTextureIndex = glTFMaterial.normalTexture.index;
+        materials[i].occlusionTextureIndex = glTFMaterial.occlusionTexture.index;
+        materials[i].emissiveTextureIndex = glTFMaterial.emissiveTexture.index;
     }
 }
 
@@ -277,19 +270,10 @@ void VulkanglTFModel::prepareAnimations(tinygltf::Model &input)
 {
     skeleton.nodeTransform.resize(input.nodes.size(), glm::mat4(1.f));
 
-    VK_CHECK_RESULT(vulkanDevice->createBuffer(
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            &skeleton.ssbo,
-            sizeof(glm::mat4) * skeleton.nodeTransform.size(), skeleton.nodeTransform.data()))
-    VK_CHECK_RESULT(skeleton.ssbo.map())
-
-
     for (auto &node: nodes)
     {
         updateNodeTransform(node);
     }
-    skeleton.ssbo.copyTo(skeleton.nodeTransform.data(), sizeof(glm::mat4) * skeleton.nodeTransform.size());
 }
 
 void
@@ -326,7 +310,7 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
     // Load node's children
     if (!inputNode.children.empty())
     {
-        for (int i : inputNode.children)
+        for (int i: inputNode.children)
         {
             loadNode(input.nodes[i], input, node, i, indexBuffer,
                      vertexBuffer);
@@ -339,19 +323,17 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
     {
         const tinygltf::Mesh mesh = input.meshes[inputNode.mesh];
         // Iterate through all primitives of this node's mesh
-        for (const auto & glTFPrimitive : mesh.primitives)
+        for (const auto &glTFPrimitive: mesh.primitives)
         {
             auto firstIndex = static_cast<uint32_t>(indexBuffer.size());
             auto vertexStart = static_cast<uint32_t>(vertexBuffer.size());
             uint32_t indexCount = 0;
-            bool hasSkin;
             // Vertices
             {
                 const float *positionBuffer = nullptr;
                 const float *normalsBuffer = nullptr;
                 const float *texCoordsBuffer = nullptr;
-                const uint16_t *jointIndicesBuffer = nullptr;
-                const float *jointWeightsBuffer = nullptr;
+                const float *tangentBuffer = nullptr;
                 size_t vertexCount = 0;
 
                 // Get buffer data for vertex normals
@@ -384,27 +366,15 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
                             accessor.byteOffset + view.byteOffset]));
                 }
 
-                // POI: Get buffer data required for vertex skinning
-                // Get vertex joint indices
-                if (glTFPrimitive.attributes.find("JOINTS_0") != glTFPrimitive.attributes.end())
+                // Get buffer data for vertex tangents
+                if (glTFPrimitive.attributes.find("TANGENT") != glTFPrimitive.attributes.end())
                 {
                     const tinygltf::Accessor &accessor = input.accessors[glTFPrimitive.attributes.find(
-                            "JOINTS_0")->second];
+                            "TANGENT")->second];
                     const tinygltf::BufferView &view = input.bufferViews[accessor.bufferView];
-                    jointIndicesBuffer = reinterpret_cast<const uint16_t *>(&(input.buffers[view.buffer].data[
+                    tangentBuffer = reinterpret_cast<const float *>(&(input.buffers[view.buffer].data[
                             accessor.byteOffset + view.byteOffset]));
                 }
-                // Get vertex joint weights
-                if (glTFPrimitive.attributes.find("WEIGHTS_0") != glTFPrimitive.attributes.end())
-                {
-                    const tinygltf::Accessor &accessor = input.accessors[glTFPrimitive.attributes.find(
-                            "WEIGHTS_0")->second];
-                    const tinygltf::BufferView &view = input.bufferViews[accessor.bufferView];
-                    jointWeightsBuffer = reinterpret_cast<const float *>(&(input.buffers[view.buffer].data[
-                            accessor.byteOffset + view.byteOffset]));
-                }
-
-                hasSkin = (jointIndicesBuffer && jointWeightsBuffer);
 
                 // Append data to model's vertex buffer
                 for (size_t v = 0; v < vertexCount; v++)
@@ -415,9 +385,7 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
                             glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f)));
                     vert.uv = texCoordsBuffer ? glm::make_vec2(&texCoordsBuffer[v * 2]) : glm::vec3(0.0f);
                     vert.color = glm::vec3(1.0f);
-                    vert.jointIndices = hasSkin ? glm::vec4(glm::make_vec4(&jointIndicesBuffer[v * 4])) : glm::vec4(
-                            0.0f);
-                    vert.jointWeights = hasSkin ? glm::make_vec4(&jointWeightsBuffer[v * 4]) : glm::vec4(0.0f);
+                    vert.tangent = tangentBuffer ? glm::make_vec4(&tangentBuffer[v * 4]) : glm::vec4(0.0f);
                     vertexBuffer.push_back(vert);
                 }
             }
@@ -435,7 +403,7 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
                     case TINYGLTF_PARAMETER_TYPE_UNSIGNED_INT:
                     {
                         const auto *buf = reinterpret_cast<const uint32_t *>(&buffer.data[accessor.byteOffset +
-                                                                                              bufferView.byteOffset]);
+                                                                                          bufferView.byteOffset]);
                         for (size_t index = 0; index < accessor.count; index++)
                         {
                             indexBuffer.push_back(buf[index] + vertexStart);
@@ -445,7 +413,7 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
                     case TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT:
                     {
                         const auto *buf = reinterpret_cast<const uint16_t *>(&buffer.data[accessor.byteOffset +
-                                                                                              bufferView.byteOffset]);
+                                                                                          bufferView.byteOffset]);
                         for (size_t index = 0; index < accessor.count; index++)
                         {
                             indexBuffer.push_back(buf[index] + vertexStart);
@@ -455,7 +423,7 @@ VulkanglTFModel::loadNode(const tinygltf::Node &inputNode, const tinygltf::Model
                     case TINYGLTF_PARAMETER_TYPE_UNSIGNED_BYTE:
                     {
                         const auto *buf = reinterpret_cast<const uint8_t *>(&buffer.data[accessor.byteOffset +
-                                                                                            bufferView.byteOffset]);
+                                                                                         bufferView.byteOffset]);
                         for (size_t index = 0; index < accessor.count; index++)
                         {
                             indexBuffer.push_back(buf[index] + vertexStart);
@@ -611,7 +579,6 @@ void VulkanglTFModel::updateAnimation(float deltaTime)
     {
         updateNodeTransform(node);
     }
-    skeleton.ssbo.copyTo(skeleton.nodeTransform.data(), skeleton.nodeTransform.size() * sizeof(glm::mat4));
 }
 
 /*
@@ -640,11 +607,8 @@ VulkanglTFModel::drawNode(VkCommandBuffer commandBuffer, VkPipelineLayout pipeli
         {
             if (primitive.indexCount > 0)
             {
-                // Get the texture index for this primitive
-                VulkanglTFModel::Texture texture = textures[materials[primitive.materialIndex].baseColorTextureIndex];
-                // Bind the descriptor for the current primitive's texture to set 1
                 vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1,
-                                        &images[texture.imageIndex].descriptorSet, 0, nullptr);
+                                        &materials[primitive.materialIndex].descriptorSet, 0, nullptr);
                 vkCmdDrawIndexed(commandBuffer, primitive.indexCount, 1, primitive.firstIndex, 0, 0);
             }
         }
@@ -662,8 +626,6 @@ void VulkanglTFModel::draw(VkCommandBuffer commandBuffer, VkPipelineLayout pipel
     VkDeviceSize offsets[1] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
     vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 2, 1,
-                            &skeleton.descriptorSet, 0, nullptr);
 
     // Render all nodes at top-level
     for (auto &node: nodes)
@@ -674,7 +636,7 @@ void VulkanglTFModel::draw(VkCommandBuffer commandBuffer, VkPipelineLayout pipel
 
 VulkanExample::VulkanExample() : VulkanExampleBase(ENABLE_VALIDATION)
 {
-    title = "homework1";
+    title = "renderer";
     camera.type = Camera::CameraType::lookat;
     camera.flipY = true;
     camera.setPosition(glm::vec3(0.0f, -0.1f, -1.0f));
@@ -695,7 +657,6 @@ VulkanExample::~VulkanExample()
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.matrices, nullptr);
     vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
-    vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.transform, nullptr);
 
     shaderData.buffer.destroy();
 }
@@ -749,7 +710,7 @@ void VulkanExample::buildCommandBuffers()
     }
 }
 
-void VulkanExample::loadglTFFile(const std::string& filename)
+void VulkanExample::loadglTFFile(const std::string &filename)
 {
     tinygltf::Model glTFInput;
     tinygltf::TinyGLTF gltfContext;
@@ -777,7 +738,7 @@ void VulkanExample::loadglTFFile(const std::string& filename)
         glTFModel.loadMaterials(glTFInput);
         glTFModel.loadTextures(glTFInput);
         const tinygltf::Scene &scene = glTFInput.scenes[0];
-        for (int i : scene.nodes)
+        for (int i: scene.nodes)
         {
             const tinygltf::Node node = glTFInput.nodes[i];
             glTFModel.loadNode(node, glTFInput, nullptr, i, indexBuffer, vertexBuffer);
@@ -872,6 +833,19 @@ void VulkanExample::loadAssets()
     loadglTFFile(getAssetPath() + "buster_drone/busterDrone.gltf");
 }
 
+void VulkanExample::loadDefaultTextureMap()
+{
+    uint32_t width = 2048, height = 2048;
+    std::vector<unsigned char> buffer(width * height * 4, 1);
+    auto bufferSize = static_cast<VkDeviceSize>(buffer.size());
+    defaultOcclusionMap.fromBuffer(buffer.data(), bufferSize, VK_FORMAT_R8G8B8A8_UNORM, width, height, vulkanDevice,
+                                   queue);
+
+    buffer.resize(width * height * 4, 0);
+    defaultEmissiveMap.fromBuffer(buffer.data(), bufferSize, VK_FORMAT_R8G8B8A8_UNORM, width, height, vulkanDevice,
+                                  queue);
+}
+
 void VulkanExample::setupDescriptors()
 {
     /*
@@ -882,10 +856,10 @@ void VulkanExample::setupDescriptors()
             vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
             // One combined image sampler per model image/texture
             vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                  static_cast<uint32_t>(glTFModel.images.size())),
+                                                  static_cast<uint32_t>(5 * glTFModel.images.size())),
             // One ssbo per skin
             vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  static_cast<uint32_t>(glTFModel.skins.size())),
+                                                  static_cast<uint32_t>(1)),
     };
     // One set for matrices and one per model image/texture
     const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + 2;
@@ -905,23 +879,26 @@ void VulkanExample::setupDescriptors()
             vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.matrices))
 
     // Descriptor set layout for passing material textures
-    setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                                     VK_SHADER_STAGE_FRAGMENT_BIT, 0);
+    std::vector<VkDescriptorSetLayoutBinding> SetLayoutBindingForTexture = {
+            vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                          VK_SHADER_STAGE_FRAGMENT_BIT, 0),
+            vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                          VK_SHADER_STAGE_FRAGMENT_BIT, 1),
+            vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                          VK_SHADER_STAGE_FRAGMENT_BIT, 2),
+            vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                          VK_SHADER_STAGE_FRAGMENT_BIT, 3),
+            vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                          VK_SHADER_STAGE_FRAGMENT_BIT, 4),
+    };
+    descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(SetLayoutBindingForTexture);
     VK_CHECK_RESULT(
             vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures))
 
-    // Descriptor set layout for passing node transformations
-    setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                                     VK_SHADER_STAGE_VERTEX_BIT, 0);
-    VK_CHECK_RESULT(
-            vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.transform))
-
     // Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material, set 2 = joint)
-    std::array<VkDescriptorSetLayout, 3> setLayouts = {
+    std::array<VkDescriptorSetLayout, 2> setLayouts = {
             descriptorSetLayouts.matrices,
             descriptorSetLayouts.textures,
-            descriptorSetLayouts.transform,
-
     };
     VkPipelineLayoutCreateInfo pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(),
                                                                                               static_cast<uint32_t>(setLayouts.size()));
@@ -946,26 +923,52 @@ void VulkanExample::setupDescriptors()
     vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 
     // Descriptor sets for glTF model materials
-    for (auto &image: glTFModel.images)
+    allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
+    for (auto &material: glTFModel.materials)
     {
-        allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool,
-                                                                                                   &descriptorSetLayouts.textures,
-                                                                                                   1);
-        VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet))
-        writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet,
-                                                                                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                                                        0,
-                                                                                        &image.texture.descriptor);
-        vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
-    }
+        VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &material.descriptorSet))
 
-    // Descriptor set for node matrix
-    allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.transform, 1);
-    VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &glTFModel.skeleton.descriptorSet))
-    writeDescriptorSet = vks::initializers::writeDescriptorSet(glTFModel.skeleton.descriptorSet,
-                                                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0,
-                                                               &glTFModel.skeleton.ssbo.descriptor);
-    vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+        std::array<VkDescriptorImageInfo *, 5> descriptorImageInfos{};
+        if (material.baseColorTextureIndex != -1)
+        {
+            descriptorImageInfos[0] = &glTFModel.images[material.baseColorTextureIndex].texture.descriptor;
+        }
+        if (material.metallicRoughnessTextureIndex != -1)
+        {
+            descriptorImageInfos[1] = &glTFModel.images[material.metallicRoughnessTextureIndex].texture.descriptor;
+        }
+        if (material.normalTextureIndex != -1)
+        {
+            descriptorImageInfos[2] = &glTFModel.images[material.normalTextureIndex].texture.descriptor;
+        }
+        if (material.emissiveTextureIndex != -1)
+        {
+            descriptorImageInfos[3] = &glTFModel.images[material.emissiveTextureIndex].texture.descriptor;
+        } else
+        {
+            descriptorImageInfos[3] = &defaultEmissiveMap.descriptor;
+        }
+        if (material.occlusionTextureIndex != -1)
+        {
+            descriptorImageInfos[4] = &glTFModel.images[material.occlusionTextureIndex].texture.descriptor;
+        } else
+        {
+            descriptorImageInfos[4] = &defaultOcclusionMap.descriptor;
+        }
+        std::vector<VkWriteDescriptorSet> writeDescriptorSets;
+        for (int i = 0; i < descriptorImageInfos.size(); ++i)
+        {
+            if (descriptorImageInfos[i] != nullptr)
+            {
+                VkWriteDescriptorSet w = vks::initializers::writeDescriptorSet(material.descriptorSet,
+                                                                               VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                                               i, descriptorImageInfos[i], 1);
+                writeDescriptorSets.emplace_back(w);
+            }
+        }
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()),
+                               writeDescriptorSets.data(), 0, nullptr);
+    }
 }
 
 void VulkanExample::preparePipelines()
@@ -996,9 +999,7 @@ void VulkanExample::preparePipelines()
             {1, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(VulkanglTFModel::Vertex, normal)},
             {2, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(VulkanglTFModel::Vertex, uv)},
             {3, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(VulkanglTFModel::Vertex, color)},
-            // POI: Per-Vertex Joint indices and weights are passed to the vertex shader
-            {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VulkanglTFModel::Vertex, jointIndices)},
-            {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VulkanglTFModel::Vertex, jointWeights)},
+            {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VulkanglTFModel::Vertex, tangent)},
     };
 
     VkPipelineVertexInputStateCreateInfo vertexInputStateCI = vks::initializers::pipelineVertexInputStateCreateInfo();
@@ -1057,13 +1058,16 @@ void VulkanExample::updateUniformBuffers()
 {
     shaderData.values.projection = camera.matrices.perspective;
     shaderData.values.model = camera.matrices.view;
+    shaderData.values.viewPos = camera.viewPos;
     memcpy(shaderData.buffer.mapped, &shaderData.values, sizeof(shaderData.values));
 }
 
 void VulkanExample::prepare()
 {
     VulkanExampleBase::prepare();
+    loadDefaultTextureMap();
     loadAssets();
+
     prepareUniformBuffers();
     setupDescriptors();
     preparePipelines();

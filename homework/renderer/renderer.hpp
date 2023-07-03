@@ -42,8 +42,13 @@ public:
     // A glTF material stores information in e.g. the texture that is attached to it and colors
     struct Material
     {
-        glm::vec4 baseColorFactor = glm::vec4(1.0f);
         uint32_t baseColorTextureIndex{};
+        uint32_t metallicRoughnessTextureIndex{};
+        uint32_t normalTextureIndex{};
+        uint32_t emissiveTextureIndex{};
+        uint32_t occlusionTextureIndex{};
+
+        VkDescriptorSet descriptorSet{};
     };
 
     // Contains the texture for a single glTF image
@@ -99,8 +104,7 @@ public:
         glm::vec3 normal;
         glm::vec2 uv;
         glm::vec3 color;
-        glm::vec4 jointIndices;
-        glm::vec4 jointWeights;
+        glm::vec4 tangent;
     };
 
     /*
@@ -138,8 +142,6 @@ public:
     struct Skeleton
     {
         std::vector<glm::mat4> nodeTransform;
-        vks::Buffer ssbo;
-        VkDescriptorSet descriptorSet{};
     } skeleton;
 
     struct Animation
@@ -206,6 +208,9 @@ public:
 
     VulkanglTFModel glTFModel;
 
+    vks::Texture2D defaultOcclusionMap{};
+    vks::Texture2D defaultEmissiveMap{};
+
     struct ShaderData
     {
         vks::Buffer buffer;
@@ -214,6 +219,7 @@ public:
             glm::mat4 projection;
             glm::mat4 model;
             glm::vec4 lightPos = glm::vec4(5.0f, 5.0f, 5.0f, 1.0f);
+            glm::vec4 viewPos;
         } values;
     } shaderData;
 
@@ -230,20 +236,21 @@ public:
     {
         VkDescriptorSetLayout matrices;
         VkDescriptorSetLayout textures;
-        VkDescriptorSetLayout transform;
     } descriptorSetLayouts{};
 
     VulkanExample();
 
     ~VulkanExample() override;
 
-    void loadglTFFile(const std::string& filename);
+    void loadglTFFile(const std::string &filename);
 
     void getEnabledFeatures() override;
 
     void buildCommandBuffers() override;
 
     void loadAssets();
+
+    void loadDefaultTextureMap();
 
     void setupDescriptors();
 
