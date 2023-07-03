@@ -154,8 +154,6 @@ public:
     struct Skeleton
     {
         std::vector<glm::mat4> nodeTransform;
-        vks::Buffer ssbo;
-        VkDescriptorSet descriptorSet{};
     } skeleton;
 
     struct Animation
@@ -193,9 +191,6 @@ public:
 			vkDestroySampler(vulkanDevice->logicalDevice, image.texture.sampler, nullptr);
 			vkFreeMemory(vulkanDevice->logicalDevice, image.texture.deviceMemory, nullptr);
 		}
-
-        // Release all Vulkan resources allocated for the animation
-        skeleton.ssbo.destroy();
 	}
 
 	/*
@@ -427,19 +422,10 @@ public:
     void prepareAnimations(tinygltf::Model &input) {
         skeleton.nodeTransform.resize(input.nodes.size(), glm::mat4(1.f));
 
-        VK_CHECK_RESULT(vulkanDevice->createBuffer(
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                &skeleton.ssbo,
-                sizeof(glm::mat4) * skeleton.nodeTransform.size(),skeleton.nodeTransform.data()));
-        VK_CHECK_RESULT(skeleton.ssbo.map());
-
-
         for (auto& node : nodes)
         {
             updateNodeTransform(node);
         }
-        skeleton.ssbo.copyTo(skeleton.nodeTransform.data(), sizeof(glm::mat4) * skeleton.nodeTransform.size());
     }
 
     void loadNode(const tinygltf::Node &inputNode, const tinygltf::Model &input, VulkanglTFModel::Node *parent, uint32_t nodeIndex, std::vector<uint32_t> &indexBuffer, std::vector<VulkanglTFModel::Vertex> &vertexBuffer) {
@@ -724,7 +710,6 @@ public:
         for (auto& node: nodes) {
             updateNodeTransform(node);
         }
-        skeleton.ssbo.copyTo(skeleton.nodeTransform.data(), skeleton.nodeTransform.size() * sizeof(glm::mat4));
     }
 
 	/*
@@ -766,7 +751,6 @@ public:
         VkDeviceSize offsets[1] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
         vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 2, 1, &skeleton.descriptorSet, 0, nullptr);
 
         // Render all nodes at top-level
         for (auto &node : nodes) {
@@ -807,7 +791,6 @@ public:
 	struct DescriptorSetLayouts {
 		VkDescriptorSetLayout matrices;
 		VkDescriptorSetLayout textures;
-        VkDescriptorSetLayout transform;
 	} descriptorSetLayouts;
 
 	VulkanExample() : VulkanExampleBase(ENABLE_VALIDATION)
@@ -832,7 +815,6 @@ public:
 		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.matrices, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
-        vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.transform, nullptr);
 
 		shaderData.buffer.destroy();
 	}
@@ -1038,10 +1020,6 @@ public:
 		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.matrices));
 
-        // Descriptor set layout for passing node transformations
-        setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
-        VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.transform));
-
 		// Descriptor set layout for passing material textures
         std::vector<VkDescriptorSetLayoutBinding> SetLayoutBindingForTexture = {
                 vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0),
@@ -1053,11 +1031,10 @@ public:
         descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(SetLayoutBindingForTexture);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures))
 
-        // Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = textures, set 2 = model transform)
-		std::array<VkDescriptorSetLayout, 3> setLayouts = {
+        // Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = textures)
+		std::array<VkDescriptorSetLayout, 2> setLayouts = {
                 descriptorSetLayouts.matrices,
                 descriptorSetLayouts.textures,
-                descriptorSetLayouts.transform,
         };
 		VkPipelineLayoutCreateInfo pipelineLayoutCI = vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 
@@ -1110,12 +1087,6 @@ public:
             }
             vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()), writeDescriptorSets.data(), 0, nullptr);
         }
-
-        // Descriptor set for node matrix
-        allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.transform, 1);
-        VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &glTFModel.skeleton.descriptorSet));
-        writeDescriptorSet = vks::initializers::writeDescriptorSet(glTFModel.skeleton.descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &glTFModel.skeleton.ssbo.descriptor);
-        vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 	}
 
 	void preparePipelines()
